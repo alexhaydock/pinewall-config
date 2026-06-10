@@ -1,0 +1,117 @@
+name: "Build and publish config package"
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+# Allow only one concurrent deployment, skipping runs queued between the run in-progress and latest queued.
+# However, do NOT cancel in-progress runs as we want to allow these production deployments to complete.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure Git identity
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          path: main
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Ensure GitHub Pages branch exists
+        working-directory: main
+        run: |
+          if git ls-remote --exit-code --heads origin gh-pages; then
+            echo "gh-pages branch exists. Doing nothing."
+          else
+            echo "gh-pages branch does not exist, creating it."
+            git checkout --orphan gh-pages
+            git rm -rf .
+            echo "<!DOCTYPE html><html><head><meta http-equiv="refresh" content="0;url=https://github.com/alexhaydock/pinewall-config"><title>Redirecting</title></head><body><a href="https://github.com/alexhaydock/pinewall-config">Redirect</a></body></html>" \
+              > index.html
+            git add index.html
+            git commit -m "Initialize gh-pages"
+            git push origin gh-pages
+            echo "checking out main"
+            git checkout main
+          fi
+
+      - name: Checkout GitHub Pages branch
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Fetch melange
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/chainguard-dev/melange/releases/latest \
+            | jq -r .tag_name)
+          curl -sL "https://github.com/chainguard-dev/melange/releases/download/${VERSION}/melange_${VERSION#v}_linux_amd64.tar.gz" -o melange.tar.gz
+          tar -xzf melange.tar.gz
+          sudo mv -v melange*/melange /usr/local/bin/
+          sudo chmod +x /usr/local/bin/melange
+
+      - name: Fetch sops
+        run: |
+          VERSION=$(curl -s https://api.github.com/repos/getsops/sops/releases/latest \
+            | jq -r .tag_name)
+          curl -sL "https://github.com/getsops/sops/releases/download/${VERSION}/sops-${VERSION}.linux.amd64" -o sops
+          sudo mv -v sops /usr/local/bin/sops
+          sudo chmod +x /usr/local/bin/sops
+
+      - name: Sync existing packages into repo workdir so we can add to existing ones
+        run: |
+          mkdir -p main/packages
+          mkdir -p gh-pages/packages
+          rsync -av \
+            gh-pages/packages/ \
+            main/packages/
+
+      - name: Generate config package with melange to be published
+        working-directory: main
+        # We use the Docker runner here since Bubblewrap is a bit of a pain inside Actions runners
+        run: |
+          # Decrypt our encrypted melange key
+          sops -d melange.rsa.age > /tmp/melange.rsa
+          melange build \
+            --runner docker \
+            --signing-key /tmp/melange.rsa \
+            --git-commit "unknown" \
+            --git-repo-url "https://unknown/unknown/unknown" \
+            --arch amd64 pinewall-config.yaml
+        env:
+          SOPS_AGE_KEY: ${{ secrets.SOPS_AGE_KEY }}  # Import age key so we can sign the package
+
+      - name: Sync newly updated package repo back into GitHub Pages dir
+        run: |
+          rsync -av \
+            main/packages/ \
+            gh-pages/packages/
+
+      - name: Commit updated packages
+        working-directory: gh-pages
+        run: |
+          git add .
+
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+
+          git commit -m "Publish packages for ${GITHUB_SHA}"
+          git push origin gh-pages
